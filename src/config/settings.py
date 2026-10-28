@@ -20,6 +20,10 @@ class Settings:
     # Payment deadline shown after a successful reservation
     PAYMENT_TIMEOUT_MINUTES: int = int(os.environ.get('PAYMENT_TIMEOUT_MINUTES', '10'))
 
+    # Optional phone alert via ntfy (https://ntfy.sh). Empty topic = macOS notification only.
+    NTFY_TOPIC: Optional[str] = os.environ.get('NTFY_TOPIC')
+    NTFY_SERVER: str = os.environ.get('NTFY_SERVER') or 'https://ntfy.sh'
+
     # Logging Configuration
     LOG_LEVEL: str = os.environ.get('LOG_LEVEL', 'INFO')
     LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

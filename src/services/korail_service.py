@@ -28,10 +28,28 @@ class DuplicateReservationError(Exception):
     """Raised when attempting to reserve a train that's already reserved."""
 
 
+class BlockedByKorailError(Exception):
+    """Raised when Korail rejects the client as an unauthorized tool. Retrying only makes it worse."""
+
+
 class _TimeoutSession(requests.Session):
     def request(self, method, url, **kwargs):
         kwargs.setdefault('timeout', REQUEST_TIMEOUT_SECONDS)
-        return super().request(method, url, **kwargs)
+        response = super().request(method, url, **kwargs)
+        _raise_if_blocked(response)
+        return response
+
+
+def _raise_if_blocked(response) -> None:
+    # Korail answers with 403 {"code": -2000, "message": "...매크로 등 미허가 도구 사용 시 이용이 제한..."}.
+    if response.status_code != 403:
+        return
+    try:
+        body = response.json()
+    except ValueError:
+        return
+    if isinstance(body, dict) and body.get("code") == -2000:
+        raise BlockedByKorailError(body.get("message", ""))
 
 
 def _create_korail(username: str, password: str) -> K2MKorail:
@@ -81,9 +99,15 @@ class KorailService:
                 logger.warning(f"Korail login failed for user: {username}")
 
             return self._logged_in
+        except BlockedByKorailError:
+            raise
         except Exception as e:
             logger.error(f"Korail login error for user {username}: {e}")
             return False
+
+    def start_without_login(self) -> None:
+        """Prepare a search-only session. Korail's train search works without an account."""
+        self._korail_instance = _create_korail("", "")
 
     def _relogin(self) -> bool:
         """Attempt to re-login with stored credentials after session expiry."""
@@ -102,6 +126,8 @@ class KorailService:
             else:
                 logger.error("❌ Re-login failed")
             return self._logged_in
+        except BlockedByKorailError:
+            raise
         except Exception as e:
             logger.error(f"❌ Re-login error: {e}")
             self._logged_in = False
@@ -140,10 +166,10 @@ class KorailService:
             List of available trains
 
         Raises:
-            ValueError: If not logged in
+            ValueError: If neither login() nor start_without_login() was called
         """
-        if not self._logged_in or not self._korail_instance:
-            raise ValueError("Must login before searching trains")
+        if not self._korail_instance:
+            raise ValueError("Must login (or start_without_login) before searching trains")
 
         if verbose:
             logger.debug(
@@ -184,6 +210,8 @@ class KorailService:
             logger.debug(f"🔒 Session expired during search, re-logging in: {e}")
             if self._relogin():
                 return []  # Will retry on next loop iteration
+            raise
+        except BlockedByKorailError:
             raise
         except Exception as e:
             logger.error(f"❌ Error searching trains: {e}", exc_info=True)
@@ -237,6 +265,8 @@ class KorailService:
             logger.debug(f"🔒 Session expired during reservation, re-logging in: {e}")
             if self._relogin():
                 return None  # Will retry on next loop iteration
+            raise
+        except BlockedByKorailError:
             raise
         except Exception as e:
             error_msg = str(e)
@@ -310,6 +340,49 @@ class KorailService:
             dep_date, src_locate, dst_locate, dep_time, max_dep_time,
             train_type, reserve_option, passenger_count, max_attempts
         )
+
+    def wait_for_seats(
+        self,
+        dep_date: str,
+        src_locate: str,
+        dst_locate: str,
+        dep_time: str = "000000",
+        max_dep_time: str = "2400",
+        train_type: TrainType = TrainType.KTX,
+        reserve_option: ReserveOption = ReserveOption.GENERAL_FIRST,
+        passenger_count: int = 1,
+        max_attempts: Optional[int] = None
+    ) -> List:
+        """
+        Search until trains with the wanted seat class show up, without reserving them.
+
+        Returns:
+            Trains with seats left, or an empty list if max_attempts reached
+        """
+        logger.info(
+            f"Starting seat watch: {src_locate} -> {dst_locate} "
+            f"on {dep_date} at {dep_time} for {passenger_count} passengers"
+        )
+
+        attempts = 0
+        while True:
+            attempts += 1
+            if max_attempts and attempts > max_attempts:
+                logger.warning(f"❌ Reached max attempts ({max_attempts}), stopping")
+                return []
+
+            if attempts % self.progress_log_interval == 0:
+                logger.info(f"📊 Search attempt #{attempts} (still searching..., re-logins: {self._relogin_count})")
+
+            trains = self._search_attempt(
+                attempts, dep_date, src_locate, dst_locate, dep_time, max_dep_time, train_type, passenger_count
+            )
+            available = [train for train in trains if _has_wanted_seat(train, reserve_option)]
+            if available:
+                logger.info(f"🔔 Seats available after {attempts} attempts: {len(available)} trains")
+                return available
+            if trains:
+                time.sleep(self._search_interval)
 
     def _search_and_reserve_consecutive(
         self,
@@ -467,6 +540,14 @@ class KorailService:
     def is_logged_in(self) -> bool:
         """Check if currently logged in."""
         return self._logged_in
+
+
+def _has_wanted_seat(train, reserve_option) -> bool:
+    if reserve_option == ReserveOption.GENERAL_ONLY:
+        return train.has_general_seat()
+    if reserve_option == ReserveOption.SPECIAL_ONLY:
+        return train.has_special_seat()
+    return train.has_seat()
 
 
 def _raise_if_duplicate(reservation) -> None:

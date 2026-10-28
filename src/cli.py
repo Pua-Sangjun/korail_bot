@@ -1,8 +1,9 @@
 """
 Terminal entry point for Korail KTX reservation.
 
-Takes the search conditions in the terminal, then searches and reserves
-until a seat is found, printing progress along the way.
+Takes the search conditions in the terminal, then searches until a seat is
+found, printing progress along the way. Depending on the mode it either
+reserves the seat or only alerts so you can book it yourself.
 
 Usage:
     python src/cli.py
@@ -10,7 +11,6 @@ Usage:
 import getpass
 import logging
 import os
-import subprocess
 import sys
 import time
 
@@ -43,10 +43,18 @@ logging.basicConfig(
 from korail2 import TrainType, ReserveOption  # noqa: E402
 
 from config.settings import settings  # noqa: E402
-from services.korail_service import KorailService, DuplicateReservationError  # noqa: E402
+from services.korail_service import (  # noqa: E402
+    BlockedByKorailError,
+    DuplicateReservationError,
+    KorailService,
+)
+from utils.notifier import notify  # noqa: E402
 from utils.validators import InputValidator  # noqa: E402
 
 PROGRESS_LOG_INTERVAL = 40  # attempts, roughly once a minute at the default search interval
+
+MODE_RESERVE = "1"
+MODE_NOTIFY_ONLY = "2"
 
 TRAIN_TYPES = {"1": (TrainType.KTX, "KTX만"), "2": (TrainType.ALL, "모든 열차")}
 SEAT_OPTIONS = {
@@ -78,14 +86,19 @@ def validate_not_empty(text: str):
     return (True, None) if text else (False, "값을 입력해주세요.")
 
 
-def notify(title: str, message: str) -> None:
-    """Show a macOS notification with sound and ring the terminal bell."""
-    print("\a", end="", flush=True)
-    script = f'display notification "{message}" with title "{title}" sound name "Glass"'
-    try:
-        subprocess.run(["osascript", "-e", script], check=False, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
+def validate_mode(text: str):
+    if text in (MODE_RESERVE, MODE_NOTIFY_ONLY):
+        return True, None
+    return False, "1 또는 2를 입력해주세요."
+
+
+def ask_mode() -> str:
+    print("━━━━━━━━━━ 모드 선택 ━━━━━━━━━━")
+    print("  1: 자리가 나면 자동 예약 (코레일 로그인 필요)")
+    print("  2: 자리가 나면 알림만 (로그인 없이 조회, 예약은 직접)")
+    mode = ask("모드", validate_mode)
+    print()
+    return mode
 
 
 def login() -> KorailService:
@@ -109,7 +122,7 @@ def login() -> KorailService:
         print("❌ 로그인 실패. 아이디와 비밀번호를 다시 확인해주세요.\n")
 
 
-def ask_search_conditions() -> dict:
+def ask_search_conditions(mode: str) -> dict:
     print("━━━━━━━━━━ 예약 조건 입력 ━━━━━━━━━━")
     dep_date = ask("출발일 (예: 20261030)", InputValidator.validate_date)
     src = ask("출발역 ('역' 제외, 예: 서울)", InputValidator.validate_station_name)
@@ -124,7 +137,7 @@ def ask_search_conditions() -> dict:
     passenger_count = int(ask("탑승 인원 (1~9)", InputValidator.validate_passenger_count))
 
     strategy_choice = "1"
-    if passenger_count > 1:
+    if passenger_count > 1 and mode == MODE_RESERVE:
         strategy_choice = ask(
             "좌석 배치 (1: 연속 좌석, 2: 랜덤 배치 - 한 자리씩 따로 잡음)",
             InputValidator.validate_seat_strategy_choice,
@@ -134,7 +147,9 @@ def ask_search_conditions() -> dict:
     reserve_option, seat_label = SEAT_OPTIONS[seat_choice]
     seat_strategy, strategy_label = SEAT_STRATEGIES[strategy_choice]
     max_time_label = "제한 없음" if max_dep_time == "2400" else f"{max_dep_time[:2]}:{max_dep_time[2:]} 전"
-    passenger_label = f"{passenger_count}명" + (f" ({strategy_label})" if passenger_count > 1 else "")
+    show_strategy = passenger_count > 1 and mode == MODE_RESERVE
+    passenger_label = f"{passenger_count}명" + (f" ({strategy_label})" if show_strategy else "")
+    mode_label = "자동 예약" if mode == MODE_RESERVE else "알림만"
 
     return {
         "dep_date": dep_date,
@@ -147,6 +162,7 @@ def ask_search_conditions() -> dict:
         "passenger_count": passenger_count,
         "seat_strategy": seat_strategy,
         "_summary": [
+            ("모드", mode_label),
             ("출발일", f"{dep_date[:4]}-{dep_date[4:6]}-{dep_date[6:]}"),
             ("구간", f"{src} → {dst}"),
             ("출발 시각", f"{dep_time[:2]}:{dep_time[2:]} ~ {max_time_label}"),
@@ -169,8 +185,12 @@ def confirm(conditions: dict) -> bool:
         print(f"  ⚠️  {error}")
 
 
+def search_params(conditions: dict) -> dict:
+    return {k: v for k, v in conditions.items() if not k.startswith("_")}
+
+
 def run_search(korail: KorailService, conditions: dict):
-    params = {k: v for k, v in conditions.items() if not k.startswith("_")}
+    params = search_params(conditions)
     duplicate_warned = False
     while True:
         try:
@@ -196,26 +216,70 @@ def print_success(reservation) -> None:
     print("  코레일톡 앱 또는 아래 링크에서 결제하세요.")
     print(f"  🔗 {settings.KORAIL_PAYMENT_URL}")
     print("🎉" * 15 + "\n")
-    notify("🎉 KTX 예약 성공", f"{settings.PAYMENT_TIMEOUT_MINUTES}분 안에 결제하세요! {reservations[0]}")
+    notify(
+        "🎉 KTX 예약 성공",
+        f"{settings.PAYMENT_TIMEOUT_MINUTES}분 안에 결제하세요! {reservations[0]}",
+        click_url=settings.KORAIL_PAYMENT_URL,
+    )
+
+
+def run_watch(korail: KorailService, conditions: dict) -> list:
+    params = search_params(conditions)
+    params.pop("seat_strategy")
+    return korail.wait_for_seats(**params)
+
+
+def print_available(trains: list) -> None:
+    print("\n" + "🔔" * 15)
+    print("  자리가 있는 열차를 찾았습니다!")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    for train in trains:
+        print(f"  {train}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  예약은 하지 않았어요. 금방 다시 매진될 수 있으니 바로 예매하세요.")
+    print("  코레일톡 앱 또는 🔗 https://www.letskorail.com")
+    print("🔔" * 15 + "\n")
+    extra = f" 외 {len(trains) - 1}개" if len(trains) > 1 else ""
+    notify("🔔 KTX 자리 있음", f"{trains[0]}{extra} - 지금 바로 예매하세요!", click_url="https://www.letskorail.com")
 
 
 def main() -> int:
     print("🚄 코레일 KTX 자동 예매 (터미널 모드)\n")
     try:
-        korail = login()
+        mode = ask_mode()
+        if mode == MODE_RESERVE:
+            korail = login()
+        else:
+            korail = KorailService()
+            korail.start_without_login()
         korail.progress_log_interval = PROGRESS_LOG_INTERVAL
 
-        conditions = ask_search_conditions()
+        conditions = ask_search_conditions(mode)
         if not confirm(conditions):
             print("취소했습니다.")
             return 0
 
         print("\n🔍 좌석 조회를 시작합니다. 약 1분마다 진행 상황이 표시돼요.")
         print("   중단하려면 Ctrl + C 를 누르세요.\n")
-        reservation = run_search(korail, conditions)
+        if mode == MODE_NOTIFY_ONLY:
+            trains = run_watch(korail, conditions)
+        else:
+            reservation = run_search(korail, conditions)
     except KeyboardInterrupt:
         print("\n\n⏹  조회를 중단했습니다.")
         return 130
+    except BlockedByKorailError as e:
+        print("\n⛔ 코레일이 이 프로그램의 접속을 막았습니다. 계속 시도하면 계정이 제한될 수 있어 중단합니다.")
+        print(f"   코레일 메시지: {e}")
+        print("   코레일톡 앱의 예약대기 기능이나 https://www.letskorail.com 을 이용해주세요.")
+        return 2
+
+    if mode == MODE_NOTIFY_ONLY:
+        if not trains:
+            print("❌ 자리가 있는 열차를 찾지 못했습니다.")
+            return 1
+        print_available(trains)
+        return 0
 
     if not reservation:
         print("❌ 예약 결과를 받지 못했습니다. 코레일 사이트에서 예약 내역을 확인해주세요.")
