@@ -219,7 +219,7 @@ def print_success(reservation) -> None:
     notify(
         "🎉 KTX 예약 성공",
         f"{settings.PAYMENT_TIMEOUT_MINUTES}분 안에 결제하세요! {reservations[0]}",
-        click_url=settings.KORAIL_PAYMENT_URL,
+        click_url=settings.KORAIL_APP_URL,
     )
 
 
@@ -240,7 +240,7 @@ def print_available(trains: list) -> None:
     print("  코레일톡 앱 또는 🔗 https://www.letskorail.com")
     print("🔔" * 15 + "\n")
     extra = f" 외 {len(trains) - 1}개" if len(trains) > 1 else ""
-    notify("🔔 KTX 자리 있음", f"{trains[0]}{extra} - 지금 바로 예매하세요!", click_url="https://www.letskorail.com")
+    notify("🔔 KTX 자리 있음", f"{trains[0]}{extra} - 지금 바로 예매하세요!", click_url=settings.KORAIL_APP_URL)
 
 
 def main() -> int:
