@@ -1,5 +1,4 @@
 """Station name validation and management for Korail."""
-import json
 import requests
 from typing import Set, Optional
 from utils.logger import get_logger
@@ -9,12 +8,8 @@ logger = get_logger(__name__)
 # API endpoint for station data
 KORAIL_STATION_DB_URL = "https://smart.letskorail.com:443/classes/com.korail.mobile.common.stationdata"
 
-# Redis cache key and TTL
-REDIS_STATION_CACHE_KEY = "korail:station_list"
-REDIS_STATION_CACHE_TTL = 86400  # 24 hours
-
 # Fallback static list (snapshot from Korail API on 2026-06-02).
-# Used only when both Redis cache and API request fail.
+# Used only when the API request fails.
 FALLBACK_STATIONS = {
     "가남", "가평", "각계", "감곡장호원", "강경", "강구", "강릉", "강진",
     "강촌", "개포", "경산", "경주", "계룡", "고래불", "고한", "곡성",
@@ -56,39 +51,10 @@ FALLBACK_STATIONS = {
 
 
 class StationManager:
-    """Manages station data with Redis caching."""
+    """Manages station data with an in-memory cache."""
 
-    _instance: Optional['StationManager'] = None
-    _redis_client = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(StationManager, cls).__new__(cls)
-            cls._instance._initialize_redis()
-        return cls._instance
-
-    def _initialize_redis(self):
-        """Initialize Redis client (lazy loading)."""
-        try:
-            from config.settings import settings
-            import redis
-
-            self._redis_client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                db=settings.REDIS_DB,
-                password=settings.REDIS_PASSWORD,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5
-            )
-            # Test connection
-            self._redis_client.ping()
-            logger.info("StationManager: Redis connected for station caching")
-        except Exception as e:
-            logger.warning(f"StationManager: Redis connection failed: {e}")
-            logger.warning("StationManager: Will operate without Redis caching")
-            self._redis_client = None
+    def __init__(self):
+        self._stations: Optional[Set[str]] = None
 
     def _fetch_stations_from_api(self) -> Set[str]:
         """
@@ -107,21 +73,20 @@ class StationManager:
                 timeout=10
             )
 
-            if response.status_code == 200:
-                data = response.json()
-                # 실측 응답 구조: {"stns": {"stn": [{"stn_nm": ..., ...}, ...]}}
-                if isinstance(data, dict) and isinstance(data.get('stns'), dict):
-                    stn_list = data['stns'].get('stn', [])
-                    stations = {s['stn_nm'] for s in stn_list if s.get('stn_nm')}
-                    if stations:
-                        logger.info(f"Successfully fetched {len(stations)} stations from API")
-                        return stations
-                logger.warning(f"Unexpected API response format: {type(data)}")
+            if response.status_code != 200:
+                logger.warning(f"API returned status code {response.status_code}")
                 return FALLBACK_STATIONS
 
-            logger.warning(f"API returned status code {response.status_code}")
+            data = response.json()
+            # 실측 응답 구조: {"stns": {"stn": [{"stn_nm": ..., ...}, ...]}}
+            if isinstance(data, dict) and isinstance(data.get('stns'), dict):
+                stn_list = data['stns'].get('stn', [])
+                stations = {s['stn_nm'] for s in stn_list if s.get('stn_nm')}
+                if stations:
+                    logger.info(f"Successfully fetched {len(stations)} stations from API")
+                    return stations
+            logger.warning(f"Unexpected API response format: {type(data)}")
             return FALLBACK_STATIONS
-
         except requests.exceptions.Timeout:
             logger.warning("API request timed out, using fallback station list")
             return FALLBACK_STATIONS
@@ -132,57 +97,11 @@ class StationManager:
             logger.error(f"Unexpected error fetching station data: {e}", exc_info=True)
             return FALLBACK_STATIONS
 
-    def _get_from_redis(self) -> Optional[Set[str]]:
-        """
-        Get station list from Redis cache.
-
-        Returns:
-            Set of station names or None if cache miss
-        """
-        if not self._redis_client:
-            return None
-
-        try:
-            cached_data = self._redis_client.get(REDIS_STATION_CACHE_KEY)
-            if cached_data:
-                stations = set(json.loads(cached_data))
-                logger.info(f"Loaded {len(stations)} stations from Redis cache")
-                return stations
-        except Exception as e:
-            logger.warning(f"Failed to load stations from Redis: {e}")
-
-        return None
-
-    def _save_to_redis(self, stations: Set[str]) -> None:
-        """
-        Save station list to Redis cache.
-
-        Args:
-            stations: Set of station names
-        """
-        if not self._redis_client:
-            return
-
-        try:
-            data = json.dumps(list(stations))
-            self._redis_client.setex(
-                REDIS_STATION_CACHE_KEY,
-                REDIS_STATION_CACHE_TTL,
-                data
-            )
-            logger.info(f"Saved {len(stations)} stations to Redis cache (TTL={REDIS_STATION_CACHE_TTL}s)")
-        except Exception as e:
-            logger.warning(f"Failed to save stations to Redis: {e}")
-
     def get_valid_stations(self, force_refresh: bool = False) -> Set[str]:
         """
-        Get valid station names with multi-tier caching.
+        Get valid station names, fetching from the API once per process.
 
-        Caching strategy:
-        1. Try Redis cache (24h TTL)
-        2. If cache miss, fetch from API
-        3. If API fails, use fallback static list
-        4. Save successful API result to Redis
+        Falls back to the static list if the API request fails.
 
         Args:
             force_refresh: Force refresh from API
@@ -190,21 +109,9 @@ class StationManager:
         Returns:
             Set of valid station names
         """
-        # Try Redis cache first (unless forced refresh)
-        if not force_refresh:
-            cached_stations = self._get_from_redis()
-            if cached_stations:
-                return cached_stations
-
-        # Fetch from API
-        logger.info("Fetching fresh station data...")
-        stations = self._fetch_stations_from_api()
-
-        # Save to Redis if not fallback
-        if stations != FALLBACK_STATIONS:
-            self._save_to_redis(stations)
-
-        return stations
+        if self._stations is None or force_refresh:
+            self._stations = self._fetch_stations_from_api()
+        return self._stations
 
 
 # Global station manager instance
@@ -236,12 +143,7 @@ def is_valid_station(station_name: str) -> bool:
     """
     if not station_name:
         return False
-
-    # Get valid stations from cache/API
-    valid_stations = get_valid_stations()
-
-    # 정확히 일치하는 역명 확인
-    return station_name in valid_stations
+    return station_name in get_valid_stations()
 
 
 def get_similar_stations(station_name: str, max_results: int = 5) -> list:
@@ -258,30 +160,18 @@ def get_similar_stations(station_name: str, max_results: int = 5) -> list:
     if not station_name:
         return []
 
-    # Get valid stations from cache/API
     valid_stations = get_valid_stations()
-
-    # 정확히 일치하면 빈 리스트 반환
     if station_name in valid_stations:
         return []
 
-    matches = []
-
     # 1. 부분 문자열 매칭 (포함 관계)
-    for valid_station in valid_stations:
-        if station_name in valid_station or valid_station in station_name:
-            matches.append(valid_station)
+    matches = [s for s in valid_stations if station_name in s or s in station_name]
 
     # 2. 첫 글자 매칭 (접두사)
-    if not matches and len(station_name) >= 1:
-        for valid_station in valid_stations:
-            if valid_station.startswith(station_name[0]):
-                matches.append(valid_station)
+    if not matches:
+        matches = [s for s in valid_stations if s.startswith(station_name[0])]
 
-    # 중복 제거 및 정렬
-    matches = sorted(list(set(matches)))
-
-    return matches[:max_results]
+    return sorted(matches)[:max_results]
 
 
 def format_station_suggestions(similar_stations: list) -> str:

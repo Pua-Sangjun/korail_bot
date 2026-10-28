@@ -1,0 +1,229 @@
+"""
+Terminal entry point for Korail KTX reservation.
+
+Takes the search conditions in the terminal, then searches and reserves
+until a seat is found, printing progress along the way.
+
+Usage:
+    python src/cli.py
+"""
+import getpass
+import logging
+import os
+import subprocess
+import sys
+import time
+
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(os.path.dirname(SRC_DIR), ".env")
+
+
+def load_env_file(path: str) -> None:
+    """Load KEY=VALUE lines into os.environ without overriding existing values."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+# config.settings reads os.environ at import time, so .env must be loaded first.
+load_env_file(ENV_FILE)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+from korail2 import TrainType, ReserveOption  # noqa: E402
+
+from config.settings import settings  # noqa: E402
+from services.korail_service import KorailService, DuplicateReservationError  # noqa: E402
+from utils.validators import InputValidator  # noqa: E402
+
+PROGRESS_LOG_INTERVAL = 40  # attempts, roughly once a minute at the default search interval
+
+TRAIN_TYPES = {"1": (TrainType.KTX, "KTX만"), "2": (TrainType.ALL, "모든 열차")}
+SEAT_OPTIONS = {
+    "1": (ReserveOption.GENERAL_FIRST, "일반실 우선"),
+    "2": (ReserveOption.GENERAL_ONLY, "일반실만"),
+    "3": (ReserveOption.SPECIAL_FIRST, "특실 우선"),
+    "4": (ReserveOption.SPECIAL_ONLY, "특실만"),
+}
+SEAT_STRATEGIES = {"1": ("consecutive", "연속 좌석"), "2": ("random", "랜덤 배치")}
+
+
+def ask(prompt: str, validate) -> str:
+    """Prompt until validate(answer) returns (True, None)."""
+    while True:
+        answer = input(f"{prompt}: ").strip()
+        is_valid, error = validate(answer)
+        if is_valid:
+            return answer
+        print(f"  ⚠️  {error}")
+
+
+def validate_max_time(text: str):
+    if text == "2400":
+        return True, None
+    return InputValidator.validate_time(text)
+
+
+def validate_not_empty(text: str):
+    return (True, None) if text else (False, "값을 입력해주세요.")
+
+
+def notify(title: str, message: str) -> None:
+    """Show a macOS notification with sound and ring the terminal bell."""
+    print("\a", end="", flush=True)
+    script = f'display notification "{message}" with title "{title}" sound name "Glass"'
+    try:
+        subprocess.run(["osascript", "-e", script], check=False, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def login() -> KorailService:
+    korail = KorailService()
+    username = settings.KORAIL_USER_ID
+    password = settings.KORAIL_PASSWORD
+
+    if username and password:
+        print(f"🔐 .env에 저장된 계정({username})으로 로그인합니다...")
+        if korail.login(username, password):
+            print("✅ 로그인 성공\n")
+            return korail
+        print("❌ .env 계정으로 로그인하지 못했습니다. 직접 입력해주세요.\n")
+
+    while True:
+        username = ask("코레일 아이디 (회원번호, 010-xxxx-xxxx, 이메일)", validate_not_empty)
+        password = getpass.getpass("코레일 비밀번호 (입력해도 화면에 표시되지 않아요): ")
+        if korail.login(username, password):
+            print("✅ 로그인 성공\n")
+            return korail
+        print("❌ 로그인 실패. 아이디와 비밀번호를 다시 확인해주세요.\n")
+
+
+def ask_search_conditions() -> dict:
+    print("━━━━━━━━━━ 예약 조건 입력 ━━━━━━━━━━")
+    dep_date = ask("출발일 (예: 20261030)", InputValidator.validate_date)
+    src = ask("출발역 ('역' 제외, 예: 서울)", InputValidator.validate_station_name)
+    dst = ask("도착역 ('역' 제외, 예: 부산)", InputValidator.validate_station_name)
+    dep_time = ask("검색 시작 시각 (HHMM, 예: 0800)", InputValidator.validate_time)
+    max_dep_time = ask("검색 최대 시각 (HHMM, 2400 = 제한 없음)", validate_max_time)
+    train_choice = ask("열차 종류 (1: KTX만, 2: 모든 열차)", InputValidator.validate_train_type_choice)
+    seat_choice = ask(
+        "좌석 (1: 일반실 우선, 2: 일반실만, 3: 특실 우선, 4: 특실만)",
+        InputValidator.validate_special_option_choice,
+    )
+    passenger_count = int(ask("탑승 인원 (1~9)", InputValidator.validate_passenger_count))
+
+    strategy_choice = "1"
+    if passenger_count > 1:
+        strategy_choice = ask(
+            "좌석 배치 (1: 연속 좌석, 2: 랜덤 배치 - 한 자리씩 따로 잡음)",
+            InputValidator.validate_seat_strategy_choice,
+        )
+
+    train_type, train_label = TRAIN_TYPES[train_choice]
+    reserve_option, seat_label = SEAT_OPTIONS[seat_choice]
+    seat_strategy, strategy_label = SEAT_STRATEGIES[strategy_choice]
+    max_time_label = "제한 없음" if max_dep_time == "2400" else f"{max_dep_time[:2]}:{max_dep_time[2:]} 전"
+    passenger_label = f"{passenger_count}명" + (f" ({strategy_label})" if passenger_count > 1 else "")
+
+    return {
+        "dep_date": dep_date,
+        "src_locate": src,
+        "dst_locate": dst,
+        "dep_time": dep_time + "00",
+        "max_dep_time": max_dep_time,
+        "train_type": train_type,
+        "reserve_option": reserve_option,
+        "passenger_count": passenger_count,
+        "seat_strategy": seat_strategy,
+        "_summary": [
+            ("출발일", f"{dep_date[:4]}-{dep_date[4:6]}-{dep_date[6:]}"),
+            ("구간", f"{src} → {dst}"),
+            ("출발 시각", f"{dep_time[:2]}:{dep_time[2:]} ~ {max_time_label}"),
+            ("열차", train_label),
+            ("좌석", seat_label),
+            ("인원", passenger_label),
+        ],
+    }
+
+
+def confirm(conditions: dict) -> bool:
+    print("\n━━━━━━━━━━ 입력한 조건 ━━━━━━━━━━")
+    for label, value in conditions["_summary"]:
+        print(f"  {label:<6} {value}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    while True:
+        is_yes, error = InputValidator.validate_yes_no(input("이 조건으로 조회를 시작할까요? (Y/N): "))
+        if is_yes is not None:
+            return is_yes
+        print(f"  ⚠️  {error}")
+
+
+def run_search(korail: KorailService, conditions: dict):
+    params = {k: v for k, v in conditions.items() if not k.startswith("_")}
+    duplicate_warned = False
+    while True:
+        try:
+            return korail.search_and_reserve_loop(**params)
+        except DuplicateReservationError:
+            if not duplicate_warned:
+                print("\n⚠️  같은 열차에 이미 예약이 있어요. 기존 예약이 취소될 때까지 10초마다 다시 시도합니다.")
+                print(f"   기존 예약 확인: {settings.KORAIL_PAYMENT_URL}\n")
+                duplicate_warned = True
+            time.sleep(10)
+
+
+def print_success(reservation) -> None:
+    reservations = getattr(reservation, "_all_reservations", [reservation])
+    print("\n" + "🎉" * 15)
+    print("  열차 예약에 성공했습니다!")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    for i, res in enumerate(reservations, 1):
+        prefix = f"  좌석 {i}: " if len(reservations) > 1 else "  "
+        print(f"{prefix}{res}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"  ⚠️  {settings.PAYMENT_TIMEOUT_MINUTES}분 안에 결제하지 않으면 예약이 취소됩니다!")
+    print("  코레일톡 앱 또는 아래 링크에서 결제하세요.")
+    print(f"  🔗 {settings.KORAIL_PAYMENT_URL}")
+    print("🎉" * 15 + "\n")
+    notify("🎉 KTX 예약 성공", f"{settings.PAYMENT_TIMEOUT_MINUTES}분 안에 결제하세요! {reservations[0]}")
+
+
+def main() -> int:
+    print("🚄 코레일 KTX 자동 예매 (터미널 모드)\n")
+    try:
+        korail = login()
+        korail.progress_log_interval = PROGRESS_LOG_INTERVAL
+
+        conditions = ask_search_conditions()
+        if not confirm(conditions):
+            print("취소했습니다.")
+            return 0
+
+        print("\n🔍 좌석 조회를 시작합니다. 약 1분마다 진행 상황이 표시돼요.")
+        print("   중단하려면 Ctrl + C 를 누르세요.\n")
+        reservation = run_search(korail, conditions)
+    except KeyboardInterrupt:
+        print("\n\n⏹  조회를 중단했습니다.")
+        return 130
+
+    if not reservation:
+        print("❌ 예약 결과를 받지 못했습니다. 코레일 사이트에서 예약 내역을 확인해주세요.")
+        return 1
+
+    print_success(reservation)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
